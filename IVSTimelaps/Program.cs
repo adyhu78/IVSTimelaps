@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Drawing;
 using System.Drawing.Imaging;
 using IntellioVideoSDK;
+using System.Text.RegularExpressions;
 
 namespace IVSTimelaps
 {
@@ -14,22 +15,37 @@ namespace IVSTimelaps
 
         int mInterval;
         PlaybackManager mPlayback;
+        DateTime mFrameTime;
         DateTime mEnd;
+
+        string mOutPath;
 
         [System.Runtime.InteropServices.DllImport("gdi32.dll")]
         private static extern bool DeleteObject(IntPtr hObject);
 
-        public Downloader(SiteConnection pConnection, VideoSource pVideoSource, DateTime pStart, DateTime pEnd, int pInterval)
+        public Downloader(SiteConnection pConnection, VideoSource pVideoSource, DateTime pStart, DateTime pEnd, int pInterval, string pOutPath)
         {
             mConnection = pConnection;
 
             mInterval = pInterval;
             mEnd = pEnd;
 
+            mOutPath = pOutPath;
+
             mPlayback = pConnection.PlaybackManager;
             mPlayback.SetVideoCallback(this, 0);
             mPlayback.AddVideoSource(pVideoSource);
-            mPlayback.Locate(pStart);
+
+            mFrameTime = pStart;
+
+            do {
+                mPlayback.Locate(mFrameTime);
+
+                mFrameTime = mFrameTime.AddSeconds(mInterval);
+            } while (mFrameTime.CompareTo(mEnd) < 0); 
+            
+            mConnection.Disconnect();
+            mConnection = null;
         }
 
         private ImageCodecInfo GetEncoderInfo(String mimeType)
@@ -47,38 +63,41 @@ namespace IVSTimelaps
 
         void IPlaybackVideoCallback.OnPlaybackVideoReceived(PlaybackVideoFrame Frame, int UserData)
         {
-            DateTime time = Frame.Time;
+            mFrameTime = Frame.Time;
 
-            Console.WriteLine(time.ToString("yyyy-MM-dd HH:mm:ss"));
+            Console.WriteLine(mFrameTime.ToString("yyyy-MM-dd HH:mm:ss"));
 
             if (Frame.VideoFrame != null)
             {
-                uint bmphandle = Frame.VideoFrame.SaveToBitmap();
-                IntPtr hbitmap = (IntPtr)(int)bmphandle;
-                Bitmap bmp = Bitmap.FromHbitmap(hbitmap);
+                if (Frame.VideoFrame.FrameType == (int) VideoFrameType.vftImage)
+                {
+                    try
+                    {
+                        uint bmphandle = Frame.VideoFrame.SaveToBitmap();
+                        if (bmphandle != 0)
+                        {
+                            IntPtr hbitmap = (IntPtr)(int)bmphandle;
+                            Bitmap bmp = Bitmap.FromHbitmap(hbitmap);
 
-                ImageCodecInfo enc = GetEncoderInfo("image/jpeg");
+                            ImageCodecInfo enc = GetEncoderInfo("image/jpeg");
 
-                EncoderParameters prms = new EncoderParameters(1);
-                prms.Param[0] = new EncoderParameter(Encoder.Compression, 75L);
-                bmp.Save(time.ToString("yyyyMMddHHmmss") + ".jpg", enc, prms);
+                            EncoderParameters prms = new EncoderParameters(1);
+                            prms.Param[0] = new EncoderParameter(Encoder.Compression, 75L);
+                            bmp.Save(mOutPath + mFrameTime.ToString("yyyyMMddHHmmss") + ".jpg", enc, prms);
 
-                DeleteObject(hbitmap);
-                GC.Collect();
+                            DeleteObject(hbitmap);
+                            GC.Collect();
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(String.Format("Error processing frame: {0}", e.Message));
+                    }
+                }
             }
             else
             {
-                Console.WriteLine("Not a valid frame");
-            }
-
-            time = time.AddSeconds(10);
-
-            if (time.CompareTo(mEnd) < 0)
-                mPlayback.Locate(time);
-            else
-            {
-                mConnection.Disconnect();
-                mConnection = null;
+                Console.WriteLine("Not a valid frame!");
             }
         }
     }
@@ -97,6 +116,8 @@ namespace IVSTimelaps
         static SiteConnection mConnection;
         static VideoSource mVideoSource;
 
+        static string mOutPath;
+
         public static VideoSource GetVideoSourceByName(string Name)
         {
             VideoSourceManager vsm = mConnection.VideoSourceManager;
@@ -109,6 +130,46 @@ namespace IVSTimelaps
                 }
             }
             return null;
+        }
+
+        static DateTime ParseDateTimeParam(string pParam)
+        {
+            var pattern = @"^([0-9]{2}):([0-9]{2})$";
+            var match = Regex.Match(pParam, pattern);
+
+            if ((match.Success) && (match.Groups.Count == 3))
+            {
+                int hour = int.Parse(match.Groups[1].Value);
+                int min = int.Parse(match.Groups[2].Value);
+                int sec = 0;
+
+                TimeSpan time = new TimeSpan(hour, min, sec);
+                DateTime date = DateTime.Today;
+
+                date = date + time;
+
+                return date;
+            }
+
+            pattern = @"^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2})$";
+            match = Regex.Match(pParam, pattern);
+
+            if ((match.Success) && (match.Groups.Count == 6))
+            {
+                int year = int.Parse(match.Groups[1].Value);
+                int month = int.Parse(match.Groups[2].Value);
+                int day = int.Parse(match.Groups[3].Value);
+
+                int hour = int.Parse(match.Groups[4].Value);
+                int min = int.Parse(match.Groups[5].Value);
+                int sec = 0;
+
+                DateTime date = new DateTime(year, month, day, hour, min, sec);
+
+                return date;
+            }
+
+            throw new Exception("Invalid date parameter");
         }
 
         static void Main(string[] args)
@@ -130,13 +191,15 @@ namespace IVSTimelaps
                 mUser = args[2];
                 mPassword = args[3];
                 mCamera = args[4];
-                mStart = DateTime.Parse(args[5]);
-                mEnd = DateTime.Parse(args[6]);
+
+                mStart = ParseDateTimeParam(args[5]);
+                mEnd = ParseDateTimeParam(args[6]);
+
                 mInterval = int.Parse(args[7]);
             }
-            catch (Exception)
+            catch (Exception e)
             {
-                Console.WriteLine("Invalid format");
+                Console.WriteLine("Invalid format: {0}", e.Message);
                 Environment.Exit(-1);
             }
           
@@ -146,9 +209,9 @@ namespace IVSTimelaps
             {
                 mConnection = connector.Connect(mAddress, mPort, mUser, mPassword);
             }
-            catch (Exception)
+            catch (Exception e)
             {
-                Console.WriteLine("Cannot connect to server ({0}:{1})", mAddress, mPort);
+                Console.WriteLine("Cannot connect to server ({0}:{1}): {2}", mAddress, mPort, e.Message);
                 Environment.Exit(-2);
             }
 
@@ -159,7 +222,9 @@ namespace IVSTimelaps
                 Environment.Exit(-3);
             }
 
-            new Downloader(mConnection, mVideoSource, mStart, mEnd, mInterval);
+            mOutPath = AppDomain.CurrentDomain.BaseDirectory;
+
+            new Downloader(mConnection, mVideoSource, mStart, mEnd, mInterval, mOutPath);
         }
     }
 }
